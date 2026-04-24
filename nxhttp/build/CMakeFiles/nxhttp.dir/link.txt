@@ -1,0 +1,2 @@
+/usr/bin/ar qc libnxhttp.a CMakeFiles/nxhttp.dir/url.cpp.o CMakeFiles/nxhttp.dir/headers.cpp.o CMakeFiles/nxhttp.dir/client.cpp.o CMakeFiles/nxhttp.dir/connection_pool.cpp.o CMakeFiles/nxhttp.dir/cache.cpp.o CMakeFiles/nxhttp.dir/punycode.cpp.o CMakeFiles/nxhttp.dir/http2.cpp.o CMakeFiles/nxhttp.dir/file_quarantine.cpp.o
+/usr/bin/ranlib libnxhttp.a

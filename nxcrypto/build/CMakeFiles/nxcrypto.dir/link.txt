@@ -1,0 +1,2 @@
+/usr/bin/ar qc libnxcrypto.a CMakeFiles/nxcrypto.dir/hash.cpp.o CMakeFiles/nxcrypto.dir/base64.cpp.o CMakeFiles/nxcrypto.dir/tls.cpp.o
+/usr/bin/ranlib libnxcrypto.a

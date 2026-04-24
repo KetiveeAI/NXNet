@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/swana/dev/search/zeprabrowser/source/nxbase/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

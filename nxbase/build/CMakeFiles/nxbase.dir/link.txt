@@ -1,0 +1,2 @@
+/usr/bin/ar qc libnxbase.a CMakeFiles/nxbase.dir/buffer.cpp.o CMakeFiles/nxbase.dir/string.cpp.o CMakeFiles/nxbase.dir/allocator.cpp.o CMakeFiles/nxbase.dir/log.cpp.o
+/usr/bin/ranlib libnxbase.a
