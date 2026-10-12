@@ -323,6 +323,11 @@ public:
         std::string rawResponse;
         int readTimeoutMs = config_.readTimeoutMs > 0 ? config_.readTimeoutMs : 30000;
         auto startRead = std::chrono::steady_clock::now();
+        bool hasReceivedData = false;
+        size_t contentLength = 0;
+        bool headersComplete = false;
+        size_t headerEndPos = 0;
+        size_t bodyBytesReceived = 0;
         
         while (true) {
             // Check if we've exceeded timeout
@@ -338,16 +343,17 @@ public:
             pfd.fd = sock;
             pfd.events = POLLIN;
             
-            int pollResult = poll(&pfd, 1, 1000);  // Wait up to 1 second
+            // After first data received, use short timeout to detect end-of-response
+            int pollTimeout = hasReceivedData ? 50 : 1000;
+            int pollResult = poll(&pfd, 1, pollTimeout);
             if (pollResult < 0) {
                 std::cerr << "[HTTPClient] Poll error" << std::endl;
                 break;
             }
             
             if (pollResult == 0) {
-                // Timeout - check if we have data already
-                if (!rawResponse.empty()) {
-                    std::cout << "[HTTPClient] Read complete: " << rawResponse.size() << " bytes" << std::endl;
+                // Timeout - if we already have data, response is likely complete
+                if (hasReceivedData) {
                     break;
                 }
                 continue;  // Keep waiting
@@ -365,6 +371,37 @@ public:
             if (received == 0) break;  // Connection closed
             
             rawResponse.append(buffer.data(), received);
+            hasReceivedData = true;
+            
+            // Parse Content-Length from headers once
+            if (!headersComplete) {
+                headerEndPos = rawResponse.find("\r\n\r\n");
+                if (headerEndPos != std::string::npos) {
+                    headersComplete = true;
+                    headerEndPos += 4; // skip \r\n\r\n
+                    // Extract Content-Length (case-insensitive search)
+                    std::string headerBlock = rawResponse.substr(0, headerEndPos);
+                    auto clPos = headerBlock.find("Content-Length: ");
+                    if (clPos == std::string::npos) {
+                        clPos = headerBlock.find("content-length: ");
+                    }
+                    if (clPos != std::string::npos) {
+                        try {
+                            contentLength = std::stoul(headerBlock.substr(clPos + 16));
+                        } catch (...) {
+                            contentLength = 0;
+                        }
+                    }
+                    bodyBytesReceived = rawResponse.size() - headerEndPos;
+                }
+            } else {
+                bodyBytesReceived += received;
+            }
+            
+            // Break immediately when full body is received
+            if (headersComplete && contentLength > 0 && bodyBytesReceived >= contentLength) {
+                break;
+            }
         }
         
         // Close connection
