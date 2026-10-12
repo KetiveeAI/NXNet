@@ -10,6 +10,12 @@
 #include "cookie_manager.hpp"
 #include "dns_resolver.hpp"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+static inline int closeSocket(int s) { return ::closesocket(static_cast<SOCKET>(s)); }
+static inline int pollSockets(WSAPOLLFD* fds, ULONG n, int timeoutMs) { return ::WSAPoll(fds, n, timeoutMs); }
+#else
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -17,6 +23,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
+static inline int closeSocket(int s) { return ::close(s); }
+static inline int pollSockets(struct pollfd* fds, nfds_t n, int timeoutMs) { return ::poll(fds, n, timeoutMs); }
+#endif
 
 #include <sstream>
 #include <chrono>
@@ -46,8 +55,10 @@ struct PooledConnection {
     bool isValid() const {
         if (socket < 0) return false;
         // Check if connection still alive (poll for errors)
-        struct pollfd pfd = {socket, POLLOUT, 0};
-        return poll(&pfd, 1, 0) >= 0 && !(pfd.revents & (POLLERR | POLLHUP));
+        struct pollfd pfd = {};
+        pfd.fd = socket;
+        pfd.events = POLLOUT;
+        return pollSockets(&pfd, 1, 0) >= 0 && !(pfd.revents & (POLLERR | POLLHUP));
     }
     
     void close() {
@@ -56,7 +67,7 @@ struct PooledConnection {
             sslSocket.reset();
         }
         if (socket >= 0) {
-            ::close(socket);
+            closeSocket(socket);
             socket = -1;
         }
     }
@@ -180,11 +191,18 @@ public:
             if (sock < 0) continue;
             
             // Set socket options
+#ifdef _WIN32
+            // Winsock takes the timeout as a DWORD of milliseconds
+            DWORD timeout = static_cast<DWORD>(config_.connectTimeoutMs);
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
             struct timeval timeout;
             timeout.tv_sec = config_.connectTimeoutMs / 1000;
             timeout.tv_usec = (config_.connectTimeoutMs % 1000) * 1000;
             setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
             setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+#endif
             
             // Connect
             if (isIPv6) {
@@ -206,7 +224,7 @@ public:
                     connected = true; break;
                 }
             }
-            close(sock);
+            closeSocket(sock);
             sock = -1;
         }
         
@@ -224,13 +242,13 @@ public:
             
             sslSocket = ctx.createSocket(sock);
             if (!sslSocket) {
-                close(sock);
+                closeSocket(sock);
                 response.setError("Failed to create SSL socket");
                 return response;
             }
             
             if (!sslSocket->connect(host)) {
-                close(sock);
+                closeSocket(sock);
                 response.setError("SSL handshake failed");
                 return response;
             }
@@ -304,7 +322,7 @@ public:
         if (sent < 0) {
             std::cerr << "[HTTPClient] Send failed!" << std::endl;
             if (sslSocket) sslSocket->close();
-            close(sock);
+            closeSocket(sock);
             response.setError("Failed to send request");
             return response;
         }
@@ -314,7 +332,7 @@ public:
             if (sslSocket) {
                 sslSocket->write(request.body().data(), request.body().size());
             } else {
-                ::send(sock, request.body().data(), request.body().size(), 0);
+                ::send(sock, reinterpret_cast<const char*>(request.body().data()), request.body().size(), 0);
             }
         }
         
@@ -345,7 +363,7 @@ public:
             
             // After first data received, use short timeout to detect end-of-response
             int pollTimeout = hasReceivedData ? 50 : 1000;
-            int pollResult = poll(&pfd, 1, pollTimeout);
+            int pollResult = pollSockets(&pfd, 1, pollTimeout);
             if (pollResult < 0) {
                 std::cerr << "[HTTPClient] Poll error" << std::endl;
                 break;
@@ -406,7 +424,7 @@ public:
         
         // Close connection
         if (sslSocket) sslSocket->close();
-        close(sock);
+        closeSocket(sock);
         
         // Parse response
         parseResponse(rawResponse, response);

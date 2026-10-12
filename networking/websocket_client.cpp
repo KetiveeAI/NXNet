@@ -8,6 +8,12 @@
 #include "websocket_client.hpp"
 #include "ssl_context.hpp"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+static inline int closeSocket(int s) { return ::closesocket(static_cast<SOCKET>(s)); }
+static inline int pollSockets(WSAPOLLFD* fds, ULONG n, int timeoutMs) { return ::WSAPoll(fds, n, timeoutMs); }
+#else
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -15,6 +21,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
+static inline int closeSocket(int s) { return ::close(s); }
+static inline int pollSockets(struct pollfd* fds, nfds_t n, int timeoutMs) { return ::poll(fds, n, timeoutMs); }
+#endif
 
 #include <random>
 #include <sstream>
@@ -146,7 +155,7 @@ bool WebSocketClient::connect(const std::string& url) {
     memcpy(&serverAddr.sin_addr, he->h_addr, he->h_length);
     
     if (::connect(socket_, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-        ::close(socket_);
+        closeSocket(socket_);
         socket_ = -1;
         if (onError_) onError_("Connection failed");
         state_ = ReadyState::Closed;
@@ -157,7 +166,7 @@ bool WebSocketClient::connect(const std::string& url) {
     if (secure) {
         auto sslSocket = getSSLContext().createSocket(socket_);
         if (!sslSocket->connect(host)) {
-            ::close(socket_);
+            closeSocket(socket_);
             socket_ = -1;
             if (onError_) onError_("SSL handshake failed");
             state_ = ReadyState::Closed;
@@ -226,8 +235,13 @@ bool WebSocketClient::connect(const std::string& url) {
     }
     
     // Set non-blocking
+#ifdef _WIN32
+    u_long nonBlocking = 1;
+    ioctlsocket(static_cast<SOCKET>(socket_), FIONBIO, &nonBlocking);
+#else
     int flags = fcntl(socket_, F_GETFL, 0);
     fcntl(socket_, F_SETFL, flags | O_NONBLOCK);
+#endif
     
     state_ = ReadyState::Open;
     if (onOpen_) onOpen_();
@@ -257,7 +271,7 @@ void WebSocketClient::close(CloseCode code, const std::string& reason) {
     }
     
     if (socket_ >= 0) {
-        ::close(socket_);
+        closeSocket(socket_);
         socket_ = -1;
     }
     
@@ -326,7 +340,7 @@ bool WebSocketClient::sendFrame(uint8_t opcode, const void* data, size_t len, bo
     if (ssl_) {
         sent = static_cast<SSLContext::SSLSocket*>(ssl_)->write(frame.data(), frame.size());
     } else {
-        sent = ::send(socket_, frame.data(), frame.size(), 0);
+        sent = ::send(socket_, reinterpret_cast<const char*>(frame.data()), frame.size(), 0);
     }
     
     return sent == static_cast<ssize_t>(frame.size());
@@ -339,7 +353,7 @@ void WebSocketClient::poll() {
     pfd.fd = socket_;
     pfd.events = POLLIN;
     
-    if (::poll(&pfd, 1, 0) <= 0) return;
+    if (pollSockets(&pfd, 1, 0) <= 0) return;
     
     WebSocketMessage msg;
     if (receiveFrame(msg)) {
@@ -354,7 +368,7 @@ bool WebSocketClient::receiveFrame(WebSocketMessage& msg) {
     if (ssl_) {
         received = static_cast<SSLContext::SSLSocket*>(ssl_)->read(header, 2);
     } else {
-        received = ::recv(socket_, header, 2, 0);
+        received = ::recv(socket_, reinterpret_cast<char*>(header), 2, 0);
     }
     
     if (received < 2) return false;
@@ -368,7 +382,7 @@ bool WebSocketClient::receiveFrame(WebSocketMessage& msg) {
         if (ssl_) {
             static_cast<SSLContext::SSLSocket*>(ssl_)->read(len16, 2);
         } else {
-            ::recv(socket_, len16, 2, 0);
+            ::recv(socket_, reinterpret_cast<char*>(len16), 2, 0);
         }
         payloadLen = (static_cast<uint64_t>(len16[0]) << 8) | len16[1];
     } else if (payloadLen == 127) {
@@ -376,7 +390,7 @@ bool WebSocketClient::receiveFrame(WebSocketMessage& msg) {
         if (ssl_) {
             static_cast<SSLContext::SSLSocket*>(ssl_)->read(len64, 8);
         } else {
-            ::recv(socket_, len64, 8, 0);
+            ::recv(socket_, reinterpret_cast<char*>(len64), 8, 0);
         }
         payloadLen = 0;
         for (int i = 0; i < 8; ++i) {
@@ -389,7 +403,7 @@ bool WebSocketClient::receiveFrame(WebSocketMessage& msg) {
         if (ssl_) {
             static_cast<SSLContext::SSLSocket*>(ssl_)->read(maskKey, 4);
         } else {
-            ::recv(socket_, maskKey, 4, 0);
+            ::recv(socket_, reinterpret_cast<char*>(maskKey), 4, 0);
         }
     }
     
@@ -398,7 +412,7 @@ bool WebSocketClient::receiveFrame(WebSocketMessage& msg) {
         if (ssl_) {
             static_cast<SSLContext::SSLSocket*>(ssl_)->read(msg.data.data(), msg.data.size());
         } else {
-            ::recv(socket_, msg.data.data(), msg.data.size(), 0);
+            ::recv(socket_, reinterpret_cast<char*>(msg.data.data()), msg.data.size(), 0);
         }
         
         if (masked) {

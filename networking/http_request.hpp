@@ -10,6 +10,11 @@
 #include <vector>
 #include <cstdint>
 
+// <winnt.h> defines DELETE as an access-right constant, which collides with HttpMethod::DELETE
+#if defined(_WIN32) && defined(DELETE)
+#undef DELETE
+#endif
+
 namespace Zepra::Networking {
 
 /**

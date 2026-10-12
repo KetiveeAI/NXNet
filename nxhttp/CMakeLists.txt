@@ -27,7 +27,7 @@ target_include_directories(nxhttp PUBLIC
 
 # Platform-specific socket libraries
 if(WIN32)
-    target_link_libraries(nxhttp ws2_32)
+    target_link_libraries(nxhttp PRIVATE ws2_32)
 endif()
 
 # Link networking library for SSL/TLS support
