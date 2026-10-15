@@ -10,6 +10,12 @@
 #include "cookie_manager.hpp"
 #include "dns_resolver.hpp"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+static inline int closeSocket(int s) { return ::closesocket(static_cast<SOCKET>(s)); }
+static inline int pollSockets(WSAPOLLFD* fds, ULONG n, int timeoutMs) { return ::WSAPoll(fds, n, timeoutMs); }
+#else
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -17,6 +23,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
+static inline int closeSocket(int s) { return ::close(s); }
+static inline int pollSockets(struct pollfd* fds, nfds_t n, int timeoutMs) { return ::poll(fds, n, timeoutMs); }
+#endif
 
 #include <sstream>
 #include <chrono>
@@ -46,8 +55,10 @@ struct PooledConnection {
     bool isValid() const {
         if (socket < 0) return false;
         // Check if connection still alive (poll for errors)
-        struct pollfd pfd = {socket, POLLOUT, 0};
-        return poll(&pfd, 1, 0) >= 0 && !(pfd.revents & (POLLERR | POLLHUP));
+        struct pollfd pfd = {};
+        pfd.fd = socket;
+        pfd.events = POLLOUT;
+        return pollSockets(&pfd, 1, 0) >= 0 && !(pfd.revents & (POLLERR | POLLHUP));
     }
     
     void close() {
@@ -56,7 +67,7 @@ struct PooledConnection {
             sslSocket.reset();
         }
         if (socket >= 0) {
-            ::close(socket);
+            closeSocket(socket);
             socket = -1;
         }
     }
@@ -180,11 +191,18 @@ public:
             if (sock < 0) continue;
             
             // Set socket options
+#ifdef _WIN32
+            // Winsock takes the timeout as a DWORD of milliseconds
+            DWORD timeout = static_cast<DWORD>(config_.connectTimeoutMs);
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
             struct timeval timeout;
             timeout.tv_sec = config_.connectTimeoutMs / 1000;
             timeout.tv_usec = (config_.connectTimeoutMs % 1000) * 1000;
             setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
             setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+#endif
             
             // Connect
             if (isIPv6) {
@@ -206,7 +224,7 @@ public:
                     connected = true; break;
                 }
             }
-            close(sock);
+            closeSocket(sock);
             sock = -1;
         }
         
@@ -224,13 +242,13 @@ public:
             
             sslSocket = ctx.createSocket(sock);
             if (!sslSocket) {
-                close(sock);
+                closeSocket(sock);
                 response.setError("Failed to create SSL socket");
                 return response;
             }
             
             if (!sslSocket->connect(host)) {
-                close(sock);
+                closeSocket(sock);
                 response.setError("SSL handshake failed");
                 return response;
             }
@@ -304,7 +322,7 @@ public:
         if (sent < 0) {
             std::cerr << "[HTTPClient] Send failed!" << std::endl;
             if (sslSocket) sslSocket->close();
-            close(sock);
+            closeSocket(sock);
             response.setError("Failed to send request");
             return response;
         }
@@ -314,7 +332,7 @@ public:
             if (sslSocket) {
                 sslSocket->write(request.body().data(), request.body().size());
             } else {
-                ::send(sock, request.body().data(), request.body().size(), 0);
+                ::send(sock, reinterpret_cast<const char*>(request.body().data()), request.body().size(), 0);
             }
         }
         
@@ -323,6 +341,11 @@ public:
         std::string rawResponse;
         int readTimeoutMs = config_.readTimeoutMs > 0 ? config_.readTimeoutMs : 30000;
         auto startRead = std::chrono::steady_clock::now();
+        bool hasReceivedData = false;
+        size_t contentLength = 0;
+        bool headersComplete = false;
+        size_t headerEndPos = 0;
+        size_t bodyBytesReceived = 0;
         
         while (true) {
             // Check if we've exceeded timeout
@@ -338,16 +361,17 @@ public:
             pfd.fd = sock;
             pfd.events = POLLIN;
             
-            int pollResult = poll(&pfd, 1, 1000);  // Wait up to 1 second
+            // After first data received, use short timeout to detect end-of-response
+            int pollTimeout = hasReceivedData ? 50 : 1000;
+            int pollResult = pollSockets(&pfd, 1, pollTimeout);
             if (pollResult < 0) {
                 std::cerr << "[HTTPClient] Poll error" << std::endl;
                 break;
             }
             
             if (pollResult == 0) {
-                // Timeout - check if we have data already
-                if (!rawResponse.empty()) {
-                    std::cout << "[HTTPClient] Read complete: " << rawResponse.size() << " bytes" << std::endl;
+                // Timeout - if we already have data, response is likely complete
+                if (hasReceivedData) {
                     break;
                 }
                 continue;  // Keep waiting
@@ -365,11 +389,42 @@ public:
             if (received == 0) break;  // Connection closed
             
             rawResponse.append(buffer.data(), received);
+            hasReceivedData = true;
+            
+            // Parse Content-Length from headers once
+            if (!headersComplete) {
+                headerEndPos = rawResponse.find("\r\n\r\n");
+                if (headerEndPos != std::string::npos) {
+                    headersComplete = true;
+                    headerEndPos += 4; // skip \r\n\r\n
+                    // Extract Content-Length (case-insensitive search)
+                    std::string headerBlock = rawResponse.substr(0, headerEndPos);
+                    auto clPos = headerBlock.find("Content-Length: ");
+                    if (clPos == std::string::npos) {
+                        clPos = headerBlock.find("content-length: ");
+                    }
+                    if (clPos != std::string::npos) {
+                        try {
+                            contentLength = std::stoul(headerBlock.substr(clPos + 16));
+                        } catch (...) {
+                            contentLength = 0;
+                        }
+                    }
+                    bodyBytesReceived = rawResponse.size() - headerEndPos;
+                }
+            } else {
+                bodyBytesReceived += received;
+            }
+            
+            // Break immediately when full body is received
+            if (headersComplete && contentLength > 0 && bodyBytesReceived >= contentLength) {
+                break;
+            }
         }
         
         // Close connection
         if (sslSocket) sslSocket->close();
-        close(sock);
+        closeSocket(sock);
         
         // Parse response
         parseResponse(rawResponse, response);

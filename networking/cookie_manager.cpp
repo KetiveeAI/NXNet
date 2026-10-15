@@ -13,6 +13,24 @@
 #include <fstream>
 #include <ctime>
 
+#ifdef _WIN32
+#include <cstring>
+#include <iomanip>
+#include <locale>
+#include <sstream>
+// The Windows CRT has no POSIX strptime; parse with std::get_time in the C locale.
+static char* strptime(const char* s, const char* format, struct tm* tm) {
+    std::istringstream in(s);
+    in.imbue(std::locale::classic());
+    in >> std::get_time(tm, format);
+    if (in.fail()) return nullptr;
+    // tellg() reports -1 once the whole input has been consumed
+    size_t consumed = in.eof() ? std::strlen(s) : static_cast<size_t>(in.tellg());
+    return const_cast<char*>(s + consumed);
+}
+static inline time_t timegm(struct tm* tm) { return _mkgmtime(tm); }
+#endif
+
 namespace Zepra::Networking {
 
 // =============================================================================
