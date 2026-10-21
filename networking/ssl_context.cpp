@@ -7,6 +7,15 @@
 
 #include "ssl_context.hpp"
 
+#ifdef _WIN32
+// Before OpenSSL: its headers #undef the wincrypt.h macros (X509_NAME, ...)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#  include <wincrypt.h>
+#endif
+
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
@@ -19,6 +28,28 @@
 #include <iostream>
 
 namespace Zepra::Networking {
+
+#ifdef _WIN32
+// Copies the certificates of a Windows system store ("ROOT", "CA") into
+// OpenSSL's trust store; returns how many were added.
+static int importWindowsCertStore(X509_STORE* store, const wchar_t* storeName) {
+    HCERTSTORE winStore = CertOpenSystemStoreW(0, storeName);
+    if (!winStore) return 0;
+    int added = 0;
+    PCCERT_CONTEXT cert = nullptr;
+    while ((cert = CertEnumCertificatesInStore(winStore, cert)) != nullptr) {
+        const unsigned char* der = cert->pbCertEncoded;
+        X509* x509 = d2i_X509(nullptr, &der, static_cast<long>(cert->cbCertEncoded));
+        if (x509) {
+            if (X509_STORE_add_cert(store, x509) == 1) added++;
+            X509_free(x509);
+        }
+    }
+    CertCloseStore(winStore, 0);
+    ERR_clear_error();  // duplicates are reported as errors; not a failure
+    return added;
+}
+#endif
 
 // =============================================================================
 // SSLContext Implementation
@@ -140,6 +171,14 @@ bool SSLContext::loadSystemCertificates() {
     if (!ctx_) return false;
     
     SSL_CTX* sslCtx = static_cast<SSL_CTX*>(ctx_);
+
+#ifdef _WIN32
+    // Windows keeps trusted roots in the system certificate stores
+    X509_STORE* store = SSL_CTX_get_cert_store(sslCtx);
+    if (importWindowsCertStore(store, L"ROOT") + importWindowsCertStore(store, L"CA") > 0) {
+        return true;
+    }
+#endif
     
     // Try common system certificate locations
     const char* paths[] = {
