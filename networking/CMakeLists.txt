@@ -40,6 +40,11 @@ target_link_libraries(networking
         CURL::libcurl
 )
 
+if(WIN32)
+    # Windows system certificate stores (trusted TLS roots)
+    target_link_libraries(networking PUBLIC crypt32)
+endif()
+
 # Compiler flags
 target_compile_options(networking PRIVATE
     -Wall -Wextra -Wpedantic
