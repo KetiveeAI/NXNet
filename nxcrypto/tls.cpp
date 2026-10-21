@@ -17,7 +17,9 @@
 typedef int socket_t;
 #else
 #include <unistd.h>
+#if !defined(__APPLE__)
 #include <sys/random.h>
+#endif
 typedef int socket_t;
 #endif
 
@@ -62,6 +64,10 @@ NxCryptoError nx_random_bytes(void* buf, size_t len) {
 #ifdef _WIN32
     // Windows: BCryptGenRandom or RtlGenRandom
     return NX_CRYPTO_ERROR_BACKEND;
+#elif defined(__APPLE__)
+    // macOS: system CSPRNG, cannot fail
+    arc4random_buf(buf, len);
+    return NX_CRYPTO_OK;
 #else
     // Linux: getrandom() or /dev/urandom
     ssize_t result = getrandom(buf, len, 0);

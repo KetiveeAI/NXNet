@@ -24,6 +24,25 @@
 #define HAS_XATTR 0
 #endif
 
+#if HAS_XATTR
+// macOS getxattr/setxattr take an extra position and options argument
+static inline ssize_t xattrGet(const char* path, const char* name, void* value, size_t size) {
+#if defined(__APPLE__)
+    return ::getxattr(path, name, value, size, 0, 0);
+#else
+    return ::getxattr(path, name, value, size);
+#endif
+}
+
+static inline int xattrSet(const char* path, const char* name, const void* value, size_t size, int flags) {
+#if defined(__APPLE__)
+    return ::setxattr(path, name, value, size, 0, flags);
+#else
+    return ::setxattr(path, name, value, size, flags);
+#endif
+}
+#endif
+
 extern "C" {
 
 // Attribute keys for file security metadata
@@ -56,7 +75,7 @@ NxFileSecurityInfo* nx_file_get_security_info(const char* path) {
     ssize_t len;
     
     // Read origin
-    len = getxattr(path, NX_XATTR_ORIGIN, buffer, sizeof(buffer) - 1);
+    len = xattrGet(path, NX_XATTR_ORIGIN, buffer, sizeof(buffer) - 1);
     if (len > 0) {
         buffer[len] = '\0';
         info->origin = static_cast<NxFileOrigin>(atoi(buffer));
@@ -64,35 +83,35 @@ NxFileSecurityInfo* nx_file_get_security_info(const char* path) {
     }
     
     // Read source URL
-    len = getxattr(path, NX_XATTR_SOURCE_URL, buffer, sizeof(buffer) - 1);
+    len = xattrGet(path, NX_XATTR_SOURCE_URL, buffer, sizeof(buffer) - 1);
     if (len > 0) {
         buffer[len] = '\0';
         info->source_url = strdup(buffer);
     }
     
     // Read domain
-    len = getxattr(path, NX_XATTR_DOMAIN, buffer, sizeof(buffer) - 1);
+    len = xattrGet(path, NX_XATTR_DOMAIN, buffer, sizeof(buffer) - 1);
     if (len > 0) {
         buffer[len] = '\0';
         info->source_domain = strdup(buffer);
     }
     
     // Read download time
-    len = getxattr(path, NX_XATTR_TIME, buffer, sizeof(buffer) - 1);
+    len = xattrGet(path, NX_XATTR_TIME, buffer, sizeof(buffer) - 1);
     if (len > 0) {
         buffer[len] = '\0';
         info->download_time = static_cast<int64_t>(atoll(buffer));
     }
     
     // Read hash
-    len = getxattr(path, NX_XATTR_HASH, buffer, 64);
+    len = xattrGet(path, NX_XATTR_HASH, buffer, 64);
     if (len > 0 && len <= 64) {
         memcpy(info->sha256, buffer, len);
         info->sha256[len] = '\0';
     }
     
     // Read verified flag
-    len = getxattr(path, NX_XATTR_VERIFIED, buffer, sizeof(buffer) - 1);
+    len = xattrGet(path, NX_XATTR_VERIFIED, buffer, sizeof(buffer) - 1);
     if (len > 0) {
         buffer[len] = '\0';
         info->user_verified = (buffer[0] == '1');
@@ -123,38 +142,38 @@ bool nx_file_set_quarantine(const char* path, const NxFileSecurityInfo* info) {
     
     // Set origin
     snprintf(buffer, sizeof(buffer), "%d", static_cast<int>(info->origin));
-    ret = setxattr(path, NX_XATTR_ORIGIN, buffer, strlen(buffer), 0);
+    ret = xattrSet(path, NX_XATTR_ORIGIN, buffer, strlen(buffer), 0);
     if (ret < 0) return false;
     
     // Set source URL
     if (info->source_url) {
-        ret = setxattr(path, NX_XATTR_SOURCE_URL, info->source_url, 
+        ret = xattrSet(path, NX_XATTR_SOURCE_URL, info->source_url, 
                       strlen(info->source_url), 0);
         if (ret < 0) return false;
     }
     
     // Set domain
     if (info->source_domain) {
-        ret = setxattr(path, NX_XATTR_DOMAIN, info->source_domain,
+        ret = xattrSet(path, NX_XATTR_DOMAIN, info->source_domain,
                       strlen(info->source_domain), 0);
         if (ret < 0) return false;
     }
     
     // Set download time
     snprintf(buffer, sizeof(buffer), "%lld", static_cast<long long>(info->download_time));
-    ret = setxattr(path, NX_XATTR_TIME, buffer, strlen(buffer), 0);
+    ret = xattrSet(path, NX_XATTR_TIME, buffer, strlen(buffer), 0);
     if (ret < 0) return false;
     
     // Set hash
     if (info->sha256[0]) {
-        ret = setxattr(path, NX_XATTR_HASH, info->sha256, strlen(info->sha256), 0);
+        ret = xattrSet(path, NX_XATTR_HASH, info->sha256, strlen(info->sha256), 0);
         if (ret < 0) return false;
     }
     
     // Set verified flag
     buffer[0] = info->user_verified ? '1' : '0';
     buffer[1] = '\0';
-    ret = setxattr(path, NX_XATTR_VERIFIED, buffer, 1, 0);
+    ret = xattrSet(path, NX_XATTR_VERIFIED, buffer, 1, 0);
     if (ret < 0) return false;
     
     return true;
@@ -170,7 +189,7 @@ bool nx_file_remove_quarantine(const char* path) {
     
 #if HAS_XATTR
     // Set verified flag to remove quarantine
-    int ret = setxattr(path, NX_XATTR_VERIFIED, "1", 1, 0);
+    int ret = xattrSet(path, NX_XATTR_VERIFIED, "1", 1, 0);
     return ret >= 0;
 #else
     (void)path;
@@ -185,7 +204,7 @@ bool nx_file_is_quarantined(const char* path) {
     char buffer[16] = {0};
     
     // Check if has origin attribute
-    ssize_t len = getxattr(path, NX_XATTR_ORIGIN, buffer, sizeof(buffer) - 1);
+    ssize_t len = xattrGet(path, NX_XATTR_ORIGIN, buffer, sizeof(buffer) - 1);
     if (len <= 0) {
         return false;  // No origin = local file, not quarantined
     }
@@ -199,7 +218,7 @@ bool nx_file_is_quarantined(const char* path) {
     }
     
     // Check verified flag
-    len = getxattr(path, NX_XATTR_VERIFIED, buffer, sizeof(buffer) - 1);
+    len = xattrGet(path, NX_XATTR_VERIFIED, buffer, sizeof(buffer) - 1);
     if (len > 0) {
         buffer[len] = '\0';
         if (buffer[0] == '1') {
