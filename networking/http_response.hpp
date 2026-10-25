@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <vector>
 #include <cstdint>
+#include <utility>
 
 namespace Zepra::Networking {
 
@@ -40,6 +41,7 @@ public:
     
     // Body
     void setBody(const std::vector<uint8_t>& body) { body_ = body; }
+    void setBody(std::vector<uint8_t>&& body) { body_ = std::move(body); }
     void appendBody(const uint8_t* data, size_t size);
     const std::vector<uint8_t>& body() const { return body_; }
     std::string bodyString() const;
