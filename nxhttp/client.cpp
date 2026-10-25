@@ -21,6 +21,7 @@
 
 // SSL/TLS Support via networking library
 #include "ssl_context.hpp"
+#include "http_response_reader.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -277,232 +278,43 @@ static bool send_all(socket_t sock, const void* data, size_t len) {
     return true;
 }
 
-static NxHttpResponse* parse_response(socket_t sock, NxHttpError* error) {
+// Reads one response; the reader works out where the body ends
+// (Content-Length, chunked, or connection close) and removes chunk framing
+static NxHttpResponse* read_response(const Zepra::Networking::HttpReadFn& read, bool head_request,
+                                     NxHttpError* error) {
+    Zepra::Networking::HttpWireResponse wire;
+    if (!Zepra::Networking::readHttpResponse(read, head_request, wire)) {
+        std::cerr << "[NXHTTP] " << wire.error << std::endl;
+        if (error) *error = wire.bytesReceived == 0 ? NX_HTTP_ERROR_RECV : NX_HTTP_ERROR_PARSE;
+        return nullptr;
+    }
+    
     NxHttpResponse* res = new NxHttpResponse();
     res->headers = nx_http_headers_create();
-    res->status = 0;
-    
-    std::vector<char> buffer;
-    char chunk[4096];
-    size_t header_end = std::string::npos;
-    
-    // Read headers
-    while (header_end == std::string::npos) {
-        int n = recv(sock, chunk, sizeof(chunk), 0);
-        if (n <= 0) break;
-        
-        size_t old_size = buffer.size();
-        buffer.insert(buffer.end(), chunk, chunk + n);
-        
-        // Look for \r\n\r\n
-        for (size_t i = old_size > 3 ? old_size - 3 : 0; i + 3 < buffer.size(); i++) {
-            if (buffer[i] == '\r' && buffer[i+1] == '\n' && 
-                buffer[i+2] == '\r' && buffer[i+3] == '\n') {
-                header_end = i + 4;
-                break;
-            }
-        }
+    res->status = wire.statusCode;
+    res->status_text = wire.statusMessage;
+    for (const auto& [name, value] : wire.headers) {
+        nx_http_headers_add(res->headers, name.c_str(), value.c_str());
     }
-    
-    if (header_end == std::string::npos) {
-        if (error) *error = NX_HTTP_ERROR_PARSE;
-        delete res;
-        return nullptr;
-    }
-    
-    // Parse status line
-    std::string headers_str(buffer.begin(), buffer.begin() + header_end);
-    size_t status_end = headers_str.find("\r\n");
-    if (status_end == std::string::npos) {
-        if (error) *error = NX_HTTP_ERROR_PARSE;
-        delete res;
-        return nullptr;
-    }
-    
-    std::string status_line = headers_str.substr(0, status_end);
-    // HTTP/1.1 200 OK
-    size_t sp1 = status_line.find(' ');
-    if (sp1 != std::string::npos) {
-        size_t sp2 = status_line.find(' ', sp1 + 1);
-        res->status = atoi(status_line.c_str() + sp1 + 1);
-        if (sp2 != std::string::npos) {
-            res->status_text = status_line.substr(sp2 + 1);
-        }
-    }
-    
-    // Parse headers
-    size_t pos = status_end + 2;
-    while (pos < header_end - 2) {
-        size_t line_end = headers_str.find("\r\n", pos);
-        if (line_end == std::string::npos) break;
-        
-        std::string line = headers_str.substr(pos, line_end - pos);
-        size_t colon = line.find(':');
-        if (colon != std::string::npos) {
-            std::string name = line.substr(0, colon);
-            std::string value = line.substr(colon + 1);
-            // Trim leading whitespace from value
-            while (!value.empty() && (value[0] == ' ' || value[0] == '\t')) {
-                value = value.substr(1);
-            }
-            nx_http_headers_add(res->headers, name.c_str(), value.c_str());
-        }
-        pos = line_end + 2;
-    }
-    
-    // Copy initial body data
-    if (header_end < buffer.size()) {
-        res->body.assign(buffer.begin() + header_end, buffer.end());
-    }
-    
-    // Check for Content-Length
-    const char* content_length = nx_http_headers_get(res->headers, "Content-Length");
-    if (content_length) {
-        size_t expected = atol(content_length);
-        while (res->body.size() < expected) {
-            int n = recv(sock, chunk, sizeof(chunk), 0);
-            if (n <= 0) break;
-            res->body.insert(res->body.end(), chunk, chunk + n);
-        }
-    } else {
-        // Check for chunked encoding
-        const char* transfer_encoding = nx_http_headers_get(res->headers, "Transfer-Encoding");
-        if (transfer_encoding && strstr(transfer_encoding, "chunked")) {
-            // TODO: Implement chunked decoding
-            // For now, read until connection close
-            while (true) {
-                int n = recv(sock, chunk, sizeof(chunk), 0);
-                if (n <= 0) break;
-                res->body.insert(res->body.end(), chunk, chunk + n);
-            }
-        }
-    }
-    
+    res->body = std::move(wire.body);
     return res;
+}
+
+static NxHttpResponse* parse_response(socket_t sock, bool head_request, NxHttpError* error) {
+    return read_response([sock](char* buf, size_t len) -> long {
+        int n = recv(sock, buf, (int)len, 0);
+        return n < 0 ? -1 : n;
+    }, head_request, error);
 }
 
 // =============================================================================
 // SSL/TLS Response Parser (Uses SSLContext::SSLSocket)
 // =============================================================================
-static NxHttpResponse* parse_response_ssl(Zepra::Networking::SSLContext::SSLSocket* sslSock, NxHttpError* error) {
-    NxHttpResponse* res = new NxHttpResponse();
-    res->headers = nx_http_headers_create();
-    res->status = 0;
-    
-    std::vector<char> buffer;
-    char chunk[4096];
-    size_t header_end = std::string::npos;
-    int read_attempts = 0;
-    const int max_attempts = 50;  // Timeout after 50 empty reads
-    
-    // Read headers via SSL
-    while (header_end == std::string::npos && read_attempts < max_attempts) {
-        int n = sslSock->read(chunk, sizeof(chunk));
-        if (n < 0) {
-            std::cerr << "[SSL Parse] Read error: " << n << std::endl;
-            break;
-        }
-        if (n == 0) {
-            read_attempts++;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
-        }
-        read_attempts = 0;  // Reset on successful read
-        
-        size_t old_size = buffer.size();
-        buffer.insert(buffer.end(), chunk, chunk + n);
-        
-        // Debug: Show first bytes received
-        if (old_size == 0 && n > 50) {
-            std::string preview(chunk, std::min(n, 100));
-            std::cout << "[SSL Parse] First bytes: " << preview.substr(0, 60) << "..." << std::endl;
-        }
-        
-        // Look for \r\n\r\n (end of headers)
-        for (size_t i = old_size > 3 ? old_size - 3 : 0; i + 3 < buffer.size(); i++) {
-            if (buffer[i] == '\r' && buffer[i+1] == '\n' && 
-                buffer[i+2] == '\r' && buffer[i+3] == '\n') {
-                header_end = i + 4;
-                break;
-            }
-        }
-    }
-    
-    if (header_end == std::string::npos) {
-        std::cerr << "[SSL Parse] No headers found after " << buffer.size() << " bytes" << std::endl;
-        if (!buffer.empty()) {
-            std::string preview(buffer.begin(), buffer.begin() + std::min(buffer.size(), (size_t)100));
-            std::cerr << "[SSL Parse] Buffer preview: " << preview << std::endl;
-        }
-        if (error) *error = NX_HTTP_ERROR_PARSE;
-        delete res;
-        return nullptr;
-    }
-    
-    // Parse status line
-    std::string headers_str(buffer.begin(), buffer.begin() + header_end);
-    size_t status_end = headers_str.find("\r\n");
-    if (status_end == std::string::npos) {
-        if (error) *error = NX_HTTP_ERROR_PARSE;
-        delete res;
-        return nullptr;
-    }
-    
-    std::string status_line = headers_str.substr(0, status_end);
-    size_t sp1 = status_line.find(' ');
-    if (sp1 != std::string::npos) {
-        size_t sp2 = status_line.find(' ', sp1 + 1);
-        res->status = atoi(status_line.c_str() + sp1 + 1);
-        if (sp2 != std::string::npos) {
-            res->status_text = status_line.substr(sp2 + 1);
-        }
-    }
-    
-    // Parse headers
-    size_t pos = status_end + 2;
-    while (pos < header_end - 2) {
-        size_t line_end = headers_str.find("\r\n", pos);
-        if (line_end == std::string::npos) break;
-        
-        std::string line = headers_str.substr(pos, line_end - pos);
-        size_t colon = line.find(':');
-        if (colon != std::string::npos) {
-            std::string name = line.substr(0, colon);
-            std::string value = line.substr(colon + 1);
-            while (!value.empty() && (value[0] == ' ' || value[0] == '\t')) {
-                value = value.substr(1);
-            }
-            nx_http_headers_add(res->headers, name.c_str(), value.c_str());
-        }
-        pos = line_end + 2;
-    }
-    
-    // Copy initial body data
-    if (header_end < buffer.size()) {
-        res->body.assign(buffer.begin() + header_end, buffer.end());
-    }
-    
-    // Read remaining body via SSL
-    const char* content_length = nx_http_headers_get(res->headers, "Content-Length");
-    if (content_length) {
-        size_t expected = atol(content_length);
-        while (res->body.size() < expected) {
-            int n = sslSock->read(chunk, sizeof(chunk));
-            if (n <= 0) break;
-            res->body.insert(res->body.end(), chunk, chunk + n);
-        }
-    } else {
-        const char* transfer_encoding = nx_http_headers_get(res->headers, "Transfer-Encoding");
-        if (transfer_encoding && strstr(transfer_encoding, "chunked")) {
-            while (true) {
-                int n = sslSock->read(chunk, sizeof(chunk));
-                if (n <= 0) break;
-                res->body.insert(res->body.end(), chunk, chunk + n);
-            }
-        }
-    }
-    
-    return res;
+static NxHttpResponse* parse_response_ssl(Zepra::Networking::SSLContext::SSLSocket* sslSock,
+                                          bool head_request, NxHttpError* error) {
+    return read_response([sslSock](char* buf, size_t len) -> long {
+        return sslSock->read(buf, len);
+    }, head_request, error);
 }
 
 extern "C" {
@@ -552,11 +364,9 @@ NxHttpResponse* nx_http_client_send(NxHttpClient* client, NxHttpRequest* req, Nx
         // Get global SSL context (auto-initializes)
         Zepra::Networking::SSLContext& sslCtx = Zepra::Networking::getSSLContext();
         
-        // Set certificate verification based on client config
-        sslCtx.setVerifyCertificate(client->config.verify_ssl);
-        
-        // Create SSL socket from raw socket
-        sslSock = sslCtx.createSocket(sock);
+        // Create SSL socket from raw socket; verification is set on this socket
+        // only, so it can't change it for other requests in flight
+        sslSock = sslCtx.createSocket(sock, client->config.verify_ssl);
         if (!sslSock) {
             std::cerr << "[NXHTTP] Failed to create SSL socket" << std::endl;
             close_socket(sock);
@@ -645,10 +455,10 @@ NxHttpResponse* nx_http_client_send(NxHttpClient* client, NxHttpRequest* req, Nx
     // Receive response
     NxHttpResponse* res = nullptr;
     if (is_https && sslSock) {
-        res = parse_response_ssl(sslSock.get(), error);
+        res = parse_response_ssl(sslSock.get(), req->method == NX_HTTP_HEAD, error);
         sslSock->close();
     } else {
-        res = parse_response(sock, error);
+        res = parse_response(sock, req->method == NX_HTTP_HEAD, error);
     }
     
     close_socket(sock);

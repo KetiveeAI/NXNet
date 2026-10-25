@@ -13,6 +13,7 @@ set(NETWORKING_SOURCES
     http_client.cpp
     http_request.cpp
     http_response.cpp
+    http_response_reader.cpp
     http_cache.cpp
     dns_resolver.cpp
     websocket_client.cpp

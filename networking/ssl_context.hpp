@@ -157,13 +157,22 @@ public:
     class SSLSocket {
     public:
         SSLSocket(SSLContext* ctx, int fd);
+        SSLSocket(SSLContext* ctx, int fd, bool verifyCertificate);
         ~SSLSocket();
         
-        bool connect(const std::string& hostname);
+        /**
+         * @brief TLS handshake
+         * @param sessionKey when set (e.g. "host:port"), a session saved under this key
+         *        by an earlier verified connection is resumed, and new sessions are saved
+         */
+        bool connect(const std::string& hostname, const std::string& sessionKey = "");
         bool accept();
         
         int read(void* buffer, size_t size);
         int write(const void* buffer, size_t size);
+        
+        /** @brief Decrypted bytes buffered inside OpenSSL (poll() can't see them) */
+        size_t pending() const;
         
         void close();
         
@@ -171,13 +180,26 @@ public:
         CertVerifyResult getVerifyResult() const;
         
     private:
+        friend struct SessionCacheAccess;
+        
         SSLContext* ctx_;
         int fd_;
         void* ssl_ = nullptr;
+        bool verifyCertificate_ = true;
+        std::string sessionKey_;
         CertVerifyResult verifyResult_ = CertVerifyResult::OK;
     };
     
     std::unique_ptr<SSLSocket> createSocket(int fd);
+    
+    /**
+     * @brief SSL socket with its own verification setting
+     *
+     * Unlike setVerifyCertificate(), this doesn't change the shared context,
+     * so a request that skips verification can't switch it off for another
+     * request running at the same time.
+     */
+    std::unique_ptr<SSLSocket> createSocket(int fd, bool verifyCertificate);
     
     /**
      * @brief Get OpenSSL error string
