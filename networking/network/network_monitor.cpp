@@ -18,7 +18,6 @@ NetworkMonitor::NetworkMonitor() {}
 NetworkMonitor::~NetworkMonitor() {}
 
 void NetworkMonitor::setEnabled(bool enabled) {
-    std::lock_guard<std::mutex> lock(mutex_);
     enabled_ = enabled;
 }
 
@@ -27,84 +26,111 @@ bool NetworkMonitor::isEnabled() const {
 }
 
 void NetworkMonitor::setRequestCallback(RequestCallback cb) {
-    request_callback_ = cb;
+    std::lock_guard<std::mutex> lock(mutex_);
+    request_callback_ = std::move(cb);
 }
 
 void NetworkMonitor::setResponseCallback(ResponseCallback cb) {
-    response_callback_ = cb;
+    std::lock_guard<std::mutex> lock(mutex_);
+    response_callback_ = std::move(cb);
 }
 
 uint64_t NetworkMonitor::recordRequest(const NetworkRequest& req) {
     if (!enabled_) return 0;
-    
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    NetworkEntry entry;
-    entry.request = req;
-    entry.request.id = next_id_++;
-    entry.request.start_time = std::chrono::system_clock::now();
-    entry.type = guessResourceType(req.url, "");
-    
-    size_t index = entries_.size();
-    entries_.push_back(entry);
-    id_to_index_[entry.request.id] = index;
-    
-    if (request_callback_) {
-        request_callback_(entry.request);
+
+    NetworkRequest recorded;
+    RequestCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        NetworkEntry entry;
+        entry.request = req;
+        entry.request.id = next_id_++;
+        entry.request.start_time = std::chrono::system_clock::now();
+        entry.type = req.initiator != NetworkResourceType::OTHER
+                         ? req.initiator : guessResourceType(req.url, "");
+
+        size_t index = entries_.size();
+        entries_.push_back(entry);
+        id_to_index_[entry.request.id] = index;
+
+        recorded = entry.request;
+        callback = request_callback_;
     }
-    
-    return entry.request.id;
+    // Outside the lock: a callback may read the monitor
+    if (callback) callback(recorded);
+    return recorded.id;
 }
 
 void NetworkMonitor::recordResponse(uint64_t request_id, const NetworkResponse& res) {
-    if (!enabled_) return;
-    
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    auto it = id_to_index_.find(request_id);
-    if (it == id_to_index_.end()) return;
-    
-    NetworkEntry& entry = entries_[it->second];
-    entry.response = res;
-    entry.response.request_id = request_id;
-    entry.response.end_time = std::chrono::system_clock::now();
-    
-    // Calculate duration
-    auto duration = entry.response.end_time - entry.request.start_time;
-    entry.response.duration_ms = std::chrono::duration<double, std::milli>(duration).count();
-    
-    // Update type based on content-type
-    entry.type = guessResourceType(entry.request.url, entry.response.content_type);
-    entry.completed = true;
-    
-    if (response_callback_) {
-        response_callback_(entry);
+    if (!enabled_ || request_id == 0) return;
+
+    NetworkEntry snapshot;
+    ResponseCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = id_to_index_.find(request_id);
+        if (it == id_to_index_.end()) return;  // cleared while in flight
+
+        NetworkEntry& entry = entries_[it->second];
+        entry.response = res;
+        entry.response.request_id = request_id;
+        entry.response.end_time = std::chrono::system_clock::now();
+
+        // Calculate duration
+        auto duration = entry.response.end_time - entry.request.start_time;
+        entry.response.duration_ms = std::chrono::duration<double, std::milli>(duration).count();
+
+        // The initiator names the type; otherwise the Content-Type and URL do
+        if (entry.request.initiator == NetworkResourceType::OTHER) {
+            entry.type = guessResourceType(entry.request.url, entry.response.content_type);
+        }
+        entry.completed = true;
+
+        snapshot = entry;
+        callback = response_callback_;
     }
+    if (callback) callback(snapshot);
 }
 
 void NetworkMonitor::recordError(uint64_t request_id, const std::string& error) {
-    if (!enabled_) return;
-    
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    auto it = id_to_index_.find(request_id);
-    if (it == id_to_index_.end()) return;
-    
-    NetworkEntry& entry = entries_[it->second];
-    entry.failed = true;
-    entry.error = error;
-    entry.completed = true;
-    
-    if (response_callback_) {
-        response_callback_(entry);
+    if (!enabled_ || request_id == 0) return;
+
+    NetworkEntry snapshot;
+    ResponseCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = id_to_index_.find(request_id);
+        if (it == id_to_index_.end()) return;
+
+        NetworkEntry& entry = entries_[it->second];
+        entry.response.end_time = std::chrono::system_clock::now();
+        auto duration = entry.response.end_time - entry.request.start_time;
+        entry.response.duration_ms = std::chrono::duration<double, std::milli>(duration).count();
+        entry.failed = true;
+        entry.error = error;
+        entry.completed = true;
+
+        snapshot = entry;
+        callback = response_callback_;
     }
+    if (callback) callback(snapshot);
 }
 
-const std::vector<NetworkEntry>& NetworkMonitor::getEntries() const {
+std::vector<NetworkEntry> NetworkMonitor::getEntries() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     return entries_;
 }
 
+void NetworkMonitor::forEachEntry(const EntryVisitor& visit) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& entry : entries_) visit(entry);
+}
+
 std::vector<NetworkEntry> NetworkMonitor::getEntriesForOrigin(const std::string& origin) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<NetworkEntry> result;
     for (const auto& entry : entries_) {
         if (entry.request.origin == origin) {
@@ -121,10 +147,12 @@ void NetworkMonitor::clear() {
 }
 
 size_t NetworkMonitor::getTotalRequests() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     return entries_.size();
 }
 
 size_t NetworkMonitor::getBlockedRequests() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     size_t count = 0;
     for (const auto& entry : entries_) {
         if (entry.request.blocked) count++;
@@ -133,14 +161,17 @@ size_t NetworkMonitor::getBlockedRequests() const {
 }
 
 double NetworkMonitor::getTotalTransferSize() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     double total = 0;
     for (const auto& entry : entries_) {
-        total += entry.response.content_length;
+        total += entry.response.transferred_bytes ? entry.response.transferred_bytes
+                                                  : entry.response.content_length;
     }
     return total;
 }
 
 std::vector<NetworkEntry> NetworkMonitor::filterByType(NetworkResourceType type) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<NetworkEntry> result;
     for (const auto& entry : entries_) {
         if (entry.type == type) {
@@ -151,6 +182,7 @@ std::vector<NetworkEntry> NetworkMonitor::filterByType(NetworkResourceType type)
 }
 
 std::vector<NetworkEntry> NetworkMonitor::filterByStatus(int min_status, int max_status) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<NetworkEntry> result;
     for (const auto& entry : entries_) {
         int status = entry.response.status_code;
@@ -162,15 +194,16 @@ std::vector<NetworkEntry> NetworkMonitor::filterByStatus(int min_status, int max
 }
 
 std::string NetworkMonitor::exportAsHAR() const {
+    std::vector<NetworkEntry> entries = getEntries();
     // Simplified HAR export
     std::stringstream ss;
     ss << "{\n  \"log\": {\n    \"entries\": [\n";
-    
+
     bool first = true;
-    for (const auto& entry : entries_) {
+    for (const auto& entry : entries) {
         if (!first) ss << ",\n";
         first = false;
-        
+
         ss << "      {\n";
         ss << "        \"request\": {\n";
         ss << "          \"method\": \"" << entry.request.method << "\",\n";
@@ -183,16 +216,15 @@ std::string NetworkMonitor::exportAsHAR() const {
         ss << "        \"time\": " << entry.response.duration_ms << "\n";
         ss << "      }";
     }
-    
+
     ss << "\n    ]\n  }\n}";
     return ss.str();
 }
 
 // Global instance
-static NetworkMonitor g_network_monitor;
-
 NetworkMonitor& getNetworkMonitor() {
-    return g_network_monitor;
+    static NetworkMonitor* monitor = new NetworkMonitor();  // outlives loader threads at exit
+    return *monitor;
 }
 
 // ============================================================================

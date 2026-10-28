@@ -26,8 +26,69 @@
 #include <sstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
+#include <unordered_map>
 
 namespace Zepra::Networking {
+
+// =============================================================================
+// TLS session cache (resumption skips the certificate exchange on reconnects)
+// =============================================================================
+
+// Only sessions from handshakes whose certificate verified are stored, and only
+// sockets that verify certificates resume them, so resumption never stands in
+// for a verification that didn't happen.
+struct SessionCacheAccess {
+    static constexpr size_t MAX_SESSIONS = 256;
+
+    std::mutex mutex;
+    std::unordered_map<std::string, SSL_SESSION*> sessions;
+
+    // Never destroyed: OpenSSL may already be cleaned up when statics are torn down
+    static SessionCacheAccess& instance() {
+        static SessionCacheAccess* cache = new SessionCacheAccess();
+        return *cache;
+    }
+
+    // Returns a new reference the caller must free, or nullptr
+    SSL_SESSION* find(const std::string& key) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = sessions.find(key);
+        if (it == sessions.end()) return nullptr;
+        if (!SSL_SESSION_is_resumable(it->second)) {
+            SSL_SESSION_free(it->second);
+            sessions.erase(it);
+            return nullptr;
+        }
+        SSL_SESSION_up_ref(it->second);
+        return it->second;
+    }
+
+    // Takes ownership of session
+    void store(const std::string& key, SSL_SESSION* session) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = sessions.find(key);
+        if (it != sessions.end()) {
+            SSL_SESSION_free(it->second);
+            it->second = session;
+            return;
+        }
+        if (sessions.size() >= MAX_SESSIONS) {
+            for (auto& entry : sessions) SSL_SESSION_free(entry.second);
+            sessions.clear();
+        }
+        sessions.emplace(key, session);
+    }
+
+    // SSL_CTX new-session callback; also receives TLS 1.3 tickets sent after the handshake
+    static int onNewSession(SSL* ssl, SSL_SESSION* session) {
+        auto* socket = static_cast<SSLContext::SSLSocket*>(SSL_get_app_data(ssl));
+        if (!socket || !socket->verifyCertificate_ || socket->sessionKey_.empty()) return 0;
+        if (SSL_get_verify_result(ssl) != X509_V_OK) return 0;
+        instance().store(socket->sessionKey_, session);
+        return 1;  // we keep the reference
+    }
+};
 
 #ifdef _WIN32
 // Copies the certificates of a Windows system store ("ROOT", "CA") into
@@ -111,6 +172,7 @@ bool SSLContext::initialize() {
     SSL_CTX_set_session_cache_mode(sslCtx, 
         SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
     SSL_CTX_sess_set_cache_size(sslCtx, 1024);
+    SSL_CTX_sess_set_new_cb(sslCtx, &SessionCacheAccess::onNewSession);
     
     // ===== Certificate Verification =====
     SSL_CTX_set_verify(sslCtx, SSL_VERIFY_PEER, nullptr);
@@ -377,6 +439,10 @@ std::unique_ptr<SSLContext::SSLSocket> SSLContext::createSocket(int fd) {
     return std::make_unique<SSLSocket>(this, fd);
 }
 
+std::unique_ptr<SSLContext::SSLSocket> SSLContext::createSocket(int fd, bool verifyCertificate) {
+    return std::make_unique<SSLSocket>(this, fd, verifyCertificate);
+}
+
 std::string SSLContext::getLastError() {
     char buf[256];
     ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));
@@ -387,13 +453,19 @@ std::string SSLContext::getLastError() {
 // SSLSocket Implementation
 // =============================================================================
 
-SSLContext::SSLSocket::SSLSocket(SSLContext* ctx, int fd) 
-    : ctx_(ctx), fd_(fd) {
-    
+SSLContext::SSLSocket::SSLSocket(SSLContext* ctx, int fd)
+    : SSLSocket(ctx, fd, ctx->verifyCertificate_) {}
+
+SSLContext::SSLSocket::SSLSocket(SSLContext* ctx, int fd, bool verifyCertificate)
+    : ctx_(ctx), fd_(fd), verifyCertificate_(verifyCertificate) {
+
     if (ctx_->ctx_) {
         ssl_ = SSL_new(static_cast<SSL_CTX*>(ctx_->ctx_));
         if (ssl_) {
-            SSL_set_fd(static_cast<SSL*>(ssl_), fd);
+            SSL* ssl = static_cast<SSL*>(ssl_);
+            SSL_set_fd(ssl, fd);
+            SSL_set_verify(ssl, verifyCertificate_ ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, nullptr);
+            SSL_set_app_data(ssl, this);
         }
     }
 }
@@ -402,19 +474,28 @@ SSLContext::SSLSocket::~SSLSocket() {
     close();
 }
 
-bool SSLContext::SSLSocket::connect(const std::string& hostname) {
+bool SSLContext::SSLSocket::connect(const std::string& hostname, const std::string& sessionKey) {
     if (!ssl_) return false;
-    
+
     SSL* ssl = static_cast<SSL*>(ssl_);
-    
+
     // Set hostname for SNI (Server Name Indication) - required for modern HTTPS
     SSL_set_tlsext_host_name(ssl, hostname.c_str());
-    
+
     // Set hostname for verification (only used if verification is enabled)
-    if (ctx_->verifyCertificate_) {
+    if (verifyCertificate_) {
         SSL_set1_host(ssl, hostname.c_str());
     }
-    
+
+    // Resume a verified session for this host if we have one
+    sessionKey_ = sessionKey;
+    if (verifyCertificate_ && !sessionKey_.empty()) {
+        if (SSL_SESSION* session = SessionCacheAccess::instance().find(sessionKey_)) {
+            SSL_set_session(ssl, session);
+            SSL_SESSION_free(session);
+        }
+    }
+
     // Perform TLS handshake
     int result = SSL_connect(ssl);
     if (result != 1) {
@@ -455,7 +536,7 @@ bool SSLContext::SSLSocket::connect(const std::string& hostname) {
     
     // If verification is disabled (verify_ssl=false), return true regardless of cert result
     // The handshake itself succeeded - we just might not trust the certificate
-    if (!ctx_->verifyCertificate_) {
+    if (!verifyCertificate_) {
         if (verifyResult_ != CertVerifyResult::OK) {
             std::cout << "[SSL] Certificate verification skipped (verify_ssl=false), result=" 
                       << static_cast<int>(verifyResult_) << std::endl;
@@ -525,10 +606,18 @@ int SSLContext::SSLSocket::write(const void* buffer, size_t size) {
     return SSL_write(static_cast<SSL*>(ssl_), buffer, static_cast<int>(size));
 }
 
+size_t SSLContext::SSLSocket::pending() const {
+    if (!ssl_) return 0;
+    int n = SSL_pending(static_cast<SSL*>(ssl_));
+    return n > 0 ? static_cast<size_t>(n) : 0;
+}
+
 void SSLContext::SSLSocket::close() {
     if (ssl_) {
-        SSL_shutdown(static_cast<SSL*>(ssl_));
-        SSL_free(static_cast<SSL*>(ssl_));
+        SSL* ssl = static_cast<SSL*>(ssl_);
+        SSL_set_app_data(ssl, nullptr);
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
         ssl_ = nullptr;
     }
 }

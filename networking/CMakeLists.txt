@@ -8,11 +8,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Source files
 set(NETWORKING_SOURCES
+    network/network_monitor.cpp
     ssl_context.cpp
     cookie_manager.cpp
     http_client.cpp
     http_request.cpp
     http_response.cpp
+    http_response_reader.cpp
     http_cache.cpp
     dns_resolver.cpp
     websocket_client.cpp

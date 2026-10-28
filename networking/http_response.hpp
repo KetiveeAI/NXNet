@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <vector>
 #include <cstdint>
+#include <utility>
 
 namespace Zepra::Networking {
 
@@ -40,6 +41,7 @@ public:
     
     // Body
     void setBody(const std::vector<uint8_t>& body) { body_ = body; }
+    void setBody(std::vector<uint8_t>&& body) { body_ = std::move(body); }
     void appendBody(const uint8_t* data, size_t size);
     const std::vector<uint8_t>& body() const { return body_; }
     std::string bodyString() const;
@@ -59,6 +61,15 @@ public:
     // Timing
     void setTimingMs(double ms) { timingMs_ = ms; }
     double timingMs() const { return timingMs_; }
+
+    // Bytes read off the connection for this response (status line, headers,
+    // body with its transfer framing); 0 when unknown
+    void setBytesReceived(size_t bytes) { bytesReceived_ = bytes; }
+    size_t bytesReceived() const { return bytesReceived_; }
+
+    // True when the connection carried an earlier request (keep-alive reuse)
+    void setConnectionReused(bool reused) { connectionReused_ = reused; }
+    bool connectionReused() const { return connectionReused_; }
     
     // Error
     void setError(const std::string& error) { error_ = error; }
@@ -75,6 +86,8 @@ private:
     std::unordered_map<std::string, std::string> headers_;
     std::vector<uint8_t> body_;
     double timingMs_ = 0;
+    size_t bytesReceived_ = 0;
+    bool connectionReused_ = false;
     std::string error_;
     std::string url_;
 };

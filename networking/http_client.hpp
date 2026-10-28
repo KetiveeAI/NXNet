@@ -72,6 +72,11 @@ public:
      * @brief Cancel all pending requests
      */
     void cancelAll();
+
+    /**
+     * @brief Close the kept-alive connections waiting for reuse (all clients share them)
+     */
+    static void closeIdleConnections();
     
     /**
      * @brief Get/Set configuration
