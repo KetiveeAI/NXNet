@@ -305,6 +305,8 @@ private:
             }
 
             fillResponse(wire, response);
+            response.setBytesReceived(wire.bytesReceived);
+            response.setConnectionReused(reused);
             if (wire.keepAlive) getConnectionPool().put(std::move(conn));
             return;
         }
