@@ -13,6 +13,23 @@
 
 namespace Zepra::Networking {
 
+using HttpHeaderList = std::vector<std::pair<std::string, std::string>>;
+
+/**
+ * @brief Where the time of a request went, in milliseconds. The phases of
+ * opening a connection (DNS, connect, TLS) are -1 when a kept-alive
+ * connection was reused; TLS is also -1 for plain HTTP.
+ */
+struct HttpTimings {
+    double redirectMs = 0;   ///< earlier hops of a redirect chain
+    double dnsMs = -1;
+    double connectMs = -1;
+    double tlsMs = -1;
+    double sendMs = 0;       ///< writing the request
+    double waitMs = 0;       ///< request sent until the first response byte
+    double receiveMs = 0;    ///< first response byte until the end of the body
+};
+
 /**
  * @brief HTTP Response
  */
@@ -38,6 +55,13 @@ public:
     std::string header(const std::string& name) const;
     bool hasHeader(const std::string& name) const;
     const std::unordered_map<std::string, std::string>& headers() const { return headers_; }
+    /// The headers as they arrived (order and repeats kept); empty for a response not read off the wire
+    void setHeaderList(HttpHeaderList list) { headerList_ = std::move(list); }
+    const HttpHeaderList& headerList() const { return headerList_; }
+
+    /// The request line's headers as sent on the final hop (Host, cookies and defaults included)
+    void setRequestHeaders(HttpHeaderList list) { requestHeaders_ = std::move(list); }
+    const HttpHeaderList& requestHeaders() const { return requestHeaders_; }
     
     // Body
     void setBody(const std::vector<uint8_t>& body) { body_ = body; }
@@ -61,6 +85,8 @@ public:
     // Timing
     void setTimingMs(double ms) { timingMs_ = ms; }
     double timingMs() const { return timingMs_; }
+    void setTimings(const HttpTimings& timings) { timings_ = timings; }
+    const HttpTimings& timings() const { return timings_; }
 
     // Bytes read off the connection for this response (status line, headers,
     // body with its transfer framing); 0 when unknown
@@ -86,6 +112,9 @@ private:
     std::unordered_map<std::string, std::string> headers_;
     std::vector<uint8_t> body_;
     double timingMs_ = 0;
+    HttpTimings timings_;
+    HttpHeaderList headerList_;
+    HttpHeaderList requestHeaders_;
     size_t bytesReceived_ = 0;
     bool connectionReused_ = false;
     std::string error_;
