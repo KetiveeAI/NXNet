@@ -69,6 +69,20 @@ struct NetworkRequest {
     std::string blocked_reason;
 };
 
+/// Where a request's time went, in milliseconds (HAR's "timings"). DNS,
+/// connect and TLS are -1 when a kept-alive connection was reused (TLS also
+/// for plain HTTP); `known` is false when the loader could not measure them.
+struct NetworkTimings {
+    bool known = false;
+    double redirect = 0;
+    double dns = -1;
+    double connect = -1;
+    double tls = -1;
+    double send = 0;
+    double wait = 0;
+    double receive = 0;
+};
+
 struct NetworkResponse {
     uint64_t request_id = 0;
     int status_code = 0;
@@ -83,6 +97,8 @@ struct NetworkResponse {
     // Body (truncated for display)
     std::string body_preview;
     bool body_truncated = false;
+
+    NetworkTimings timings;
 
     // Security
     bool is_secure = false;           // HTTPS
@@ -129,6 +145,8 @@ public:
      */
     uint64_t recordRequest(const NetworkRequest& req);
     void recordResponse(uint64_t request_id, const NetworkResponse& res);
+    /// The request's headers as sent, known once the client wrote them
+    void recordRequestHeaders(uint64_t request_id, std::vector<NetworkHeader> headers);
     void recordError(uint64_t request_id, const std::string& error);
 
     /// A snapshot of the entries, taken under the lock

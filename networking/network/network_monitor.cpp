@@ -94,6 +94,14 @@ void NetworkMonitor::recordResponse(uint64_t request_id, const NetworkResponse& 
     if (callback) callback(snapshot);
 }
 
+void NetworkMonitor::recordRequestHeaders(uint64_t request_id, std::vector<NetworkHeader> headers) {
+    if (!enabled_ || request_id == 0) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = id_to_index_.find(request_id);
+    if (it == id_to_index_.end()) return;
+    entries_[it->second].request.headers = std::move(headers);
+}
+
 void NetworkMonitor::recordError(uint64_t request_id, const std::string& error) {
     if (!enabled_ || request_id == 0) return;
 

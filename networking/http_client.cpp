@@ -46,6 +46,12 @@ static inline int pollSockets(struct pollfd* fds, nfds_t n, int timeoutMs) { ret
 
 namespace Zepra::Networking {
 
+using Clock = std::chrono::steady_clock;
+
+static double msBetween(Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
 #ifdef MSG_NOSIGNAL
 static constexpr int SEND_FLAGS = MSG_NOSIGNAL;
 #else
@@ -234,23 +240,29 @@ private:
             !response.location().empty() && redirectsLeft > 0) {
             std::string target = resolveLocation(request, response.location());
             int code = response.statusCode();
+            HttpResponse final;
             if ((code == 307 || code == 308) && originOf(target) == originOf(request.url())) {
                 // Same method and body; headers only stay within the same origin
                 HttpRequest next = request;
                 next.setUrl(target);
-                return sendFollowingRedirects(next, redirectsLeft - 1);
+                final = sendFollowingRedirects(next, redirectsLeft - 1);
+            } else {
+                HttpRequest next(code == 307 || code == 308 ? request.method() : HttpMethod::GET, target);
+                if (code == 307 || code == 308) next.setBody(request.body());
+                final = sendFollowingRedirects(next, redirectsLeft - 1);
             }
-            HttpRequest next(code == 307 || code == 308 ? request.method() : HttpMethod::GET, target);
-            if (code == 307 || code == 308) next.setBody(request.body());
-            return sendFollowingRedirects(next, redirectsLeft - 1);
+            // The timings describe the final hop; this hop counts as redirect time
+            double total = msBetween(startTime, Clock::now());
+            HttpTimings timings = final.timings();
+            timings.redirectMs += std::max(0.0, total - final.timingMs());
+            final.setTimings(timings);
+            final.setTimingMs(total);
+            return final;
         }
 
         response.setUrl(request.url());
 
-        auto endTime = std::chrono::steady_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            endTime - startTime);
-        response.setTimingMs(static_cast<double>(duration.count()));
+        response.setTimingMs(msBetween(startTime, Clock::now()));
 
         return response;
     }
@@ -262,19 +274,23 @@ private:
         bool secure = request.isSecure();
         std::string key = (secure ? "https://" : "http://") + host + ":" + std::to_string(port) +
                           (secure && !config_.verifySsl ? "#noverify" : "");
-        std::string requestBytes = buildRequest(request, host, port, secure);
+        HttpHeaderList sentHeaders;
+        std::string requestBytes = buildRequest(request, host, port, secure, sentHeaders);
+        response.setRequestHeaders(std::move(sentHeaders));
         bool headRequest = request.method() == HttpMethod::HEAD;
         int readTimeoutMs = config_.readTimeoutMs > 0 ? config_.readTimeoutMs : 30000;
 
         // A reused connection may have been closed by the server just as we sent;
         // if nothing came back, the request is retried once on a new connection
         for (int attempt = 0; attempt < 2; ++attempt) {
+            HttpTimings timings;   // of this attempt only
             std::unique_ptr<Connection> conn;
             if (attempt == 0) conn = getConnectionPool().take(key);
             if (!conn) {
                 std::string error;
-                conn = openConnection(host, port, secure, error);
+                conn = openConnection(host, port, secure, error, timings);
                 if (!conn) {
+                    response.setTimings(timings);
                     response.setError(error);
                     return;
                 }
@@ -282,7 +298,11 @@ private:
             }
             bool reused = conn->reused;
 
-            if (!conn->writeAll(requestBytes.data(), requestBytes.size())) {
+            auto sendStart = Clock::now();
+            bool sent = conn->writeAll(requestBytes.data(), requestBytes.size());
+            auto sendEnd = Clock::now();
+            timings.sendMs = msBetween(sendStart, sendEnd);
+            if (!sent) {
                 if (reused) continue;
                 std::cerr << "[HTTPClient] Send failed!" << std::endl;
                 response.setError("Failed to send request");
@@ -291,9 +311,19 @@ private:
 
             HttpWireResponse wire;
             Connection* c = conn.get();
+            Clock::time_point firstByte;
+            bool gotByte = false;
             bool ok = readHttpResponse(
-                [c, readTimeoutMs](char* buf, size_t len) { return c->read(buf, len, readTimeoutMs); },
+                [c, readTimeoutMs, &firstByte, &gotByte](char* buf, size_t len) {
+                    long n = c->read(buf, len, readTimeoutMs);
+                    if (n > 0 && !gotByte) { gotByte = true; firstByte = Clock::now(); }
+                    return n;
+                },
                 headRequest, wire);
+            auto readEnd = Clock::now();
+            timings.waitMs = msBetween(sendEnd, gotByte ? firstByte : readEnd);
+            timings.receiveMs = gotByte ? msBetween(firstByte, readEnd) : 0;
+            response.setTimings(timings);
             if (!ok) {
                 if (reused && wire.bytesReceived == 0) continue;
                 response.setError("Invalid response: " + wire.error);
@@ -313,7 +343,9 @@ private:
         response.setError("Connection closed by server");
     }
 
-    std::string buildRequest(const HttpRequest& request, const std::string& host, int port, bool secure) {
+    // The request's bytes; `sent` gets its header lines in the order written
+    std::string buildRequest(const HttpRequest& request, const std::string& host, int port, bool secure,
+                             HttpHeaderList& sent) {
         std::ostringstream reqStream;
         std::string pathAndQuery = request.path();
         if (pathAndQuery.empty()) pathAndQuery = "/";  // Use / for empty path
@@ -366,12 +398,23 @@ private:
         reqStream << "\r\n";
 
         std::string bytes = reqStream.str();
+
+        // Every "Name: value" line between the request line and the blank line
+        size_t pos = bytes.find("\r\n") + 2;
+        for (size_t end; (end = bytes.find("\r\n", pos)) != std::string::npos && end > pos; pos = end + 2) {
+            size_t colon = bytes.find(':', pos);
+            if (colon == std::string::npos || colon > end) continue;
+            size_t value = bytes.find_first_not_of(' ', colon + 1);
+            if (value == std::string::npos || value > end) value = end;
+            sent.emplace_back(bytes.substr(pos, colon - pos), bytes.substr(value, end - value));
+        }
         bytes.append(request.body().begin(), request.body().end());
         return bytes;
     }
 
+    // A new connection; fills the DNS, connect and TLS phases of `timings`
     std::unique_ptr<Connection> openConnection(const std::string& host, int port, bool secure,
-                                               std::string& error) {
+                                               std::string& error, HttpTimings& timings) {
 #if !defined(_WIN32) && !defined(SO_NOSIGPIPE)
         // TLS writes go through OpenSSL's write(), which MSG_NOSIGNAL can't reach:
         // a server closing a kept-alive connection must not kill the process
@@ -385,7 +428,10 @@ private:
 #endif
 
         // Resolve DNS
+        auto dnsStart = Clock::now();
         DnsResult dns = getDnsResolver().resolve(host);
+        auto connectStart = Clock::now();
+        timings.dnsMs = msBetween(dnsStart, connectStart);
         if (!dns.success || dns.addresses.empty()) {
             error = "DNS resolution failed: " + dns.error;
             return nullptr;
@@ -445,6 +491,7 @@ private:
             sock = -1;
         }
 
+        timings.connectMs = msBetween(connectStart, Clock::now());
         if (!connected || sock < 0) {
             error = "Connection failed to all resolved IPs";
             return nullptr;
@@ -462,7 +509,10 @@ private:
                 return nullptr;
             }
 
-            if (!conn->sslSocket->connect(host, host + ":" + std::to_string(port))) {
+            auto tlsStart = Clock::now();
+            bool handshake = conn->sslSocket->connect(host, host + ":" + std::to_string(port));
+            timings.tlsMs = msBetween(tlsStart, Clock::now());
+            if (!handshake) {
                 error = "SSL handshake failed";
                 return nullptr;
             }
@@ -489,6 +539,7 @@ private:
             }
         }
 
+        response.setHeaderList(std::move(wire.headers));
         response.setBody(std::move(wire.body));
     }
 
