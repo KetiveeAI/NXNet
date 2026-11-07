@@ -31,7 +31,7 @@ NxUrl* nx_url_parse(const char* url) {
         memcpy(u->scheme, p, len);
         u->scheme[len] = '\0';
         // Convert to lowercase
-        for (char* c = u->scheme; *c; c++) *c = tolower(*c);
+        for (char* c = u->scheme; *c; c++) *c = static_cast<char>(tolower(static_cast<unsigned char>(*c)));
         p = scheme_end + 3;
     } else {
         u->scheme = strdup("http");
@@ -44,30 +44,37 @@ NxUrl* nx_url_parse(const char* url) {
         u->port = 80;
     }
     
-    // Parse userinfo (user:pass@)
-    const char* at = strchr(p, '@');
-    const char* slash = strchr(p, '/');
-    if (at && (!slash || at < slash)) {
+    // The authority ends at the first "/", "?" or "#" (RFC 3986 section 3.2)
+    const char* authority_end = p;
+    while (authority_end < end && *authority_end != '/' && *authority_end != '?' &&
+           *authority_end != '#') {
+        authority_end++;
+    }
+
+    // Parse userinfo (user:pass@): the last "@" inside the authority only, so
+    // "http://a.com?x=@b.com" stays on a.com instead of going to b.com
+    const char* at = nullptr;
+    for (const char* c = p; c < authority_end; c++) {
+        if (*c == '@') at = c;
+    }
+    if (at) {
         size_t len = at - p;
         u->userinfo = static_cast<char*>(malloc(len + 1));
         memcpy(u->userinfo, p, len);
         u->userinfo[len] = '\0';
         p = at + 1;
     }
-    
+
     // Parse host:port
-    const char* host_end = p;
-    while (host_end < end && *host_end != '/' && *host_end != '?' && *host_end != '#') {
-        host_end++;
-    }
-    
+    const char* host_end = authority_end;
+
     // Check for port
     const char* colon = nullptr;
     // Handle IPv6 addresses [::1]:port
     if (*p == '[') {
-        const char* bracket = strchr(p, ']');
-        if (bracket && bracket < host_end) {
-            colon = strchr(bracket, ':');
+        const char* bracket = static_cast<const char*>(memchr(p, ']', host_end - p));
+        if (bracket && bracket + 1 < host_end && bracket[1] == ':') {
+            colon = bracket + 1;
         }
     } else {
         // Find last colon (for IPv4 or hostname)
@@ -78,25 +85,39 @@ NxUrl* nx_url_parse(const char* url) {
             }
         }
     }
-    
-    if (colon && colon < host_end) {
+
+    if (colon) {
         size_t host_len = colon - p;
         u->host = static_cast<char*>(malloc(host_len + 1));
         memcpy(u->host, p, host_len);
         u->host[host_len] = '\0';
-        u->port = atoi(colon + 1);
+        // Digits only, 1..65535; an empty port keeps the scheme's default
+        if (colon + 1 < host_end) {
+            long port = 0;
+            for (const char* c = colon + 1; c < host_end; c++) {
+                if (*c < '0' || *c > '9' || port > 65535) { port = -1; break; }
+                port = port * 10 + (*c - '0');
+            }
+            if (port < 1 || port > 65535) {
+                nx_url_free(u);
+                return nullptr;
+            }
+            u->port = static_cast<int>(port);
+        }
     } else {
         size_t host_len = host_end - p;
         u->host = static_cast<char*>(malloc(host_len + 1));
         memcpy(u->host, p, host_len);
         u->host[host_len] = '\0';
     }
-    
+
     p = host_end;
     
     // Parse path
-    const char* query_start = strchr(p, '?');
+    // A "?" after the "#" belongs to the fragment, not the query
     const char* frag_start = strchr(p, '#');
+    const char* query_start = static_cast<const char*>(
+        memchr(p, '?', (frag_start ? frag_start : end) - p));
     const char* path_end = query_start ? query_start : (frag_start ? frag_start : end);
     
     if (path_end > p) {

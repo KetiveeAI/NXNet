@@ -29,7 +29,13 @@ namespace Zepra::Networking {
 // DNS Cache Entry
 // =============================================================================
 
-struct CacheEntry {
+namespace {
+
+// Kept out of the namespace scope on purpose: http_cache.hpp declares a different
+// Zepra::Networking::CacheEntry, and two classes of one name break the one-definition
+// rule. The linker then picked one set of inline members for both, and a debug build
+// crashed copying a DnsResult into the DNS cache on the first lookup.
+struct DnsCacheEntry {
     DnsResult result;
     std::chrono::steady_clock::time_point expiry;
     
@@ -37,6 +43,8 @@ struct CacheEntry {
         return std::chrono::steady_clock::now() < expiry;
     }
 };
+
+} // namespace
 
 // =============================================================================
 // DNS Resolver Implementation
@@ -74,7 +82,7 @@ public:
         // Cache result
         if (result.success) {
             std::lock_guard<std::mutex> lock(cacheMutex_);
-            CacheEntry entry;
+            DnsCacheEntry entry;
             entry.result = result;
             entry.expiry = std::chrono::steady_clock::now() + result.ttl;
             cache_[hostname] = entry;
@@ -210,7 +218,7 @@ private:
     };
     
     std::mutex cacheMutex_;
-    std::unordered_map<std::string, CacheEntry> cache_;
+    std::unordered_map<std::string, DnsCacheEntry> cache_;
     
     std::mutex queueMutex_;
     std::condition_variable cv_;
