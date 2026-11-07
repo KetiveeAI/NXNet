@@ -269,6 +269,11 @@ private:
 
     // One request/response on a pooled or new connection
     void exchange(const HttpRequest& request, HttpResponse& response) {
+        std::string invalid;
+        if (!request.validate(invalid)) {
+            response.setError(invalid);
+            return;
+        }
         std::string host = request.host();
         int port = request.port();
         bool secure = request.isSecure();
@@ -354,7 +359,7 @@ private:
         }
 
         reqStream << request.methodString() << " " << pathAndQuery << " HTTP/1.1\r\n";
-        reqStream << "Host: " << host;
+        reqStream << "Host: " << request.hostHeader();
         if ((secure && port != 443) || (!secure && port != 80)) {
             reqStream << ":" << port;
         }

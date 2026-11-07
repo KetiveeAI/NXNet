@@ -77,6 +77,14 @@ public:
     std::string query() const;
     
     bool isSecure() const;
+
+    // Host as it goes in the Host header (an IPv6 literal keeps its brackets)
+    std::string hostHeader() const;
+
+    // False (with a reason) if the URL or a header can't be sent as written: not
+    // http(s), no host, a port outside 1..65535, a space or control character in the
+    // request target, or a line break in a header (request splitting)
+    bool validate(std::string& error) const;
     
 private:
     std::string url_;
